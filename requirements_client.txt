@@ -1,6 +1,6 @@
 # Dependencies for the client machine only (no GPU required)
 opencv-python>=4.7.0
-mediapipe>=0.10.9
+mediapipe>=0.10.9,<=0.10.14
 msgpack>=1.0.7
 websockets>=12.0
 numpy>=1.23.0

@@ -26,6 +26,8 @@ import queue
 import sys
 import threading
 import time
+import tkinter as tk
+from tkinter import filedialog
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -358,6 +360,29 @@ def _display_loop(params_ref: dict, source_path_ref: list):
 
 
 # ------------------------------------------------------------------ #
+# Source-face picker                                                   #
+# ------------------------------------------------------------------ #
+
+def _pick_source_face() -> str:
+    """Block until the user selects a source image; exit if cancelled."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title="Select source face image",
+        filetypes=[
+            ("Images", "*.jpg *.jpeg *.png *.webp *.bmp"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    if not path:
+        print("No source face selected — exiting.")
+        sys.exit(0)
+    return path
+
+
+# ------------------------------------------------------------------ #
 # Entry point                                                          #
 # ------------------------------------------------------------------ #
 _ws_loop: asyncio.AbstractEventLoop | None = None
@@ -382,6 +407,9 @@ def main():
     parser.add_argument("--height", type=int, default=int(os.getenv("CAPTURE_HEIGHT", "720")),
                         help="Capture height (env: CAPTURE_HEIGHT)")
     args = parser.parse_args()
+
+    if not args.source:
+        args.source = _pick_source_face()
 
     params_ref: dict = {}
     source_path_ref: list = [args.source]
