@@ -1,193 +1,140 @@
-![image](https://github.com/Hillobar/Rope/assets/63615199/40f7397f-713c-4813-ac86-bab36f6bd5ba)
+# Rope
 
-Rope implements the insightface inswapper_128 model as a **real-time client-server face swap system**. The server runs the GAN inference on GPU; a lightweight client handles face detection and streams video over WebSocket.
-
----
-
-## Architecture
-
-```
-Client device (CPU only)               Server (GPU required)
-────────────────────────               ──────────────────────────────────
-Webcam → MediaPipe face detection      FastAPI + WebSocket (server.py)
-  ↓ crop faces, extract landmarks        ├─ inswapper_128 GAN
-  ──── WebSocket (LAN/VPN) ──────►       ├─ GFPGAN / GPEN / CodeFormer
-  ◄─── swapped face crops ────────       └─ occluder, face parser
-  ↓ composite back into frame
-  ↓ display
-```
-
-The client sends padded face crops + 5-point keypoints to the server. The server swaps the face and returns the processed crop. No full frames are transmitted.
+Real-time face swap over a local network. A GPU server runs the GAN; a lightweight client streams webcam frames to it and displays the result.
 
 ---
 
-## Requirements
+## Quick start — client
 
-### Server machine (GPU)
-- NVIDIA GPU with CUDA 11.8
-- Python 3.10+
+If someone else is running the server, this is all you need.
 
-### Client machine
-- Python 3.10+
-- Webcam
-- No GPU required
-
----
-
-## Model Files
-
-Place the following ONNX model files in the `models/` directory on the **server**:
-
-| File | Required | Purpose |
-|------|----------|---------|
-| `inswapper_128.fp16.onnx` | Yes | Face swapper |
-| `det_10g.onnx` | Yes | Face detection |
-| `w600k_r50.onnx` | Yes | ArcFace recognition |
-| `GFPGANv1.4.onnx` | Optional | Face restoration |
-| `GPEN-BFR-512.onnx` | Optional | Face restoration |
-| `GPEN-BFR-256.onnx` | Optional | Face restoration |
-| `codeformer_fp16.onnx` | Optional | Face restoration |
-| `occluder.onnx` | Optional | Occlusion masking |
-| `faceparser_fp16.onnx` | Optional | Face parsing |
-
-These are the same models used by the original Rope GUI.
-
----
-
-## Installation
-
-### Server
-```bash
-git clone <repo>
-cd Rope
-pip install -r requirements.txt
-```
-
-### Client (separate machine)
+**1. Clone and install**
 ```bash
 git clone <repo>
 cd Rope
 pip install -r requirements_client.txt
 ```
 
----
-
-## Configuration
-
-Both `server.py` and `client.py` read from a `.env` file. Copy the example and fill in your values:
-
+**2. Create your `.env`**
 ```bash
 cp .env.example .env
 ```
-
-**`.env` on the server:**
-```ini
-HOST=0.0.0.0
-PORT=8765
-SOURCE_PATH=/path/to/source_face.jpg   # or a folder of images
-```
-
-**`.env` on the client:**
+Edit `.env` and set:
 ```ini
 SERVER_URL=ws://SERVER_IP:8765/ws
-SOURCE_PATH=/path/to/source_face.jpg   # or a folder of images
-CAMERA_INDEX=0
-CAPTURE_WIDTH=1280
-CAPTURE_HEIGHT=720
+SOURCE_PATH=/path/to/your/source_face.jpg
 ```
 
-> `.env` is gitignored. Never commit it.
-
-CLI arguments override `.env` values if both are provided.
-
----
-
-## Running
-
-### 1. Start the server
-
-```bash
-python server.py
-```
-
-Or with explicit arguments:
-```bash
-python server.py --source /path/to/source.jpg --host 0.0.0.0 --port 8765
-```
-
-You will see:
-```
-Loading models …
-Models ready.
-Source face loaded: 1/1 image(s) used
-Uvicorn running on http://0.0.0.0:8765
-```
-
-### 2. Test connectivity (from the client machine)
-
-```bash
-# HTTP health check
-curl http://SERVER_IP:8765/health
-# {"status":"ok","models_loaded":true,"source_face_loaded":true}
-
-# Browser status page + WebSocket ping test
-open http://SERVER_IP:8765/
-```
-
-### 3. Start the client
-
+**3. Run**
 ```bash
 python client.py
 ```
 
-Or with explicit arguments:
-```bash
-python client.py --server ws://SERVER_IP:8765/ws --source /path/to/source.jpg
-```
+A window opens with the face swap applied live. If `SOURCE_PATH` is not set in `.env`, a file picker will appear on launch.
 
-A webcam preview window opens with the face swap applied in real time.
-
----
-
-## Source Face
-
-The source face (the identity to swap onto detected faces) can be:
-
-- **A single image:** `--source /path/to/face.jpg`
-- **A folder of images of the same person:** `--source /path/to/folder/`
-
-When a folder is provided, the server computes an ArcFace embedding for each image and averages them, producing a more robust identity representation across different lighting and angles.
-
-The source can be set at server startup via `SOURCE_PATH` in `.env` or `--source`, or sent at runtime by the client.
-
----
-
-## Client Controls
+**Controls**
 
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
 | `s` | Resend source face to server |
-| `r` | Toggle face restorer (GFPGAN) on/off |
-| `+` | Increase blend smoothing |
-| `-` | Decrease blend smoothing |
+| `r` | Cycle enhance mode: off → GPEN-256 → GPEN-512 → off |
+| `m` | Toggle mouth mask (preserves original mouth) |
+| `+` / `-` | Opacity up / down (0.05 steps) |
 
 ---
 
-## Performance
+## Server setup
 
-Server: 3090Ti (24GB), i5-13600K  
-Benchmark: `benchmark/target-1080p.mp4`, 2048×1080, 25 fps
+### Requirements
+- NVIDIA GPU (CUDA 12, cuDNN 9)
+- Python 3.10+
+- conda recommended
 
-| Mode | Time (5 threads) |
-|------|-----------------|
-| Swap 128 | 4.4s |
-| Swap 256 | 8.6s |
-| Swap 512 | 28.6s |
-| Swap + GFPGAN | 9.3s |
-| Swap + CodeFormer | 11.3s |
-| Swap + Occluder | 4.7s |
-| Swap + MouthParser | 5.1s |
+### Install
+```bash
+conda create -n rope python=3.10
+conda activate rope
+pip install -r requirements.txt
+```
+
+### Model files
+
+Place these in the `models/` directory:
+
+| File | Required | Purpose |
+|------|----------|---------|
+| `inswapper_128.onnx` | Yes | Face swapper (FP32) |
+| `GPEN-BFR-256.onnx` | Optional | Fast face enhancement |
+| `GPEN-BFR-512.onnx` | Optional | High-quality face enhancement |
+
+InsightFace detection models (`buffalo_l`) are downloaded automatically on first run to `~/.insightface/models/`.
+
+### Configure
+```bash
+cp .env.example .env
+```
+Edit `.env`:
+```ini
+SOURCE_PATH=/path/to/source_face.jpg   # or a folder of images
+HOST=0.0.0.0
+PORT=8765
+```
+
+### Run
+```bash
+python server.py
+```
+
+With verbose per-frame timing:
+```bash
+python server.py --verbose
+```
+
+Verify it's up:
+```bash
+curl http://SERVER_IP:8765/health
+# {"status":"ok","models_loaded":true,"source_face_loaded":true}
+```
+
+---
+
+## Source face
+
+`SOURCE_PATH` can be a single image or a folder of images of the same person. Multiple images give a more robust identity embedding across different lighting and angles.
+
+The source face can be set at server startup (via `.env` or `--source`) or sent at runtime by the client (key `s`).
+
+---
+
+## Parameter test grid
+
+`test_params.py` sends a frozen frame through 8 preset configurations and shows the results side-by-side so you can visually compare quality vs. speed trade-offs.
+
+```bash
+python test_params.py --source /path/to/source.jpg
+# or use a static image instead of webcam:
+python test_params.py --source /path/to/source.jpg --image /path/to/test_frame.jpg
+```
+
+Keys: `n`/`space` = new snapshot, `s` = save PNG, `q` = quit.
+
+---
+
+## Architecture
+
+```
+Client (CPU only)                    Server (GPU)
+─────────────────                    ────────────────────────────
+Webcam capture                       FastAPI + WebSocket
+  ↓ JPEG encode (downscaled)
+  ──── WebSocket ──────────────────► InsightFace detection
+  ◄─── swapped JPEG ───────────────  inswapper_128 GAN
+  ↓ decode + upscale                 GPEN-256 / GPEN-512 (optional)
+  ↓ cross-fade display
+```
+
+Frames are downscaled before sending (default `--send-scale 0.5`) and upscaled after receipt to reduce bandwidth and server decode cost. The server does all face detection and inference; the client is pure I/O.
 
 ---
 
