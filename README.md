@@ -1,72 +1,200 @@
 ![image](https://github.com/Hillobar/Rope/assets/63615199/40f7397f-713c-4813-ac86-bab36f6bd5ba)
 
+Rope implements the insightface inswapper_128 model as a **real-time client-server face swap system**. The server runs the GAN inference on GPU; a lightweight client handles face detection and streams video over WebSocket.
 
-Rope implements the insightface inswapper_128 model with a helpful GUI.
-### [Discord](https://discord.gg/EcdVAFJzqp)
+---
 
-### [Donate](https://www.paypal.com/donate/?hosted_button_id=Y5SB9LSXFGRF2)
+## Architecture
 
-### [Wiki with install instructions and usage](https://github.com/Hillobar/Rope/wiki)
+```
+Client device (CPU only)               Server (GPU required)
+────────────────────────               ──────────────────────────────────
+Webcam → MediaPipe face detection      FastAPI + WebSocket (server.py)
+  ↓ crop faces, extract landmarks        ├─ inswapper_128 GAN
+  ──── WebSocket (LAN/VPN) ──────►       ├─ GFPGAN / GPEN / CodeFormer
+  ◄─── swapped face crops ────────       └─ occluder, face parser
+  ↓ composite back into frame
+  ↓ display
+```
 
-### [Demo Video (Rope-Ruby)](https://www.youtube.com/watch?v=4Y4U0TZ8cWY)
+The client sends padded face crops + 5-point keypoints to the server. The server swaps the face and returns the processed crop. No full frames are transmitted.
 
-### ${{\color{Goldenrod}{\textsf{Last Updated 2024-05-27}}}}$ ###
-### ${{\color{Goldenrod}{\textsf{Welcome to Rope-Pearl!}}}}$ ###
+---
 
-![Screenshot 2024-02-10 104718](https://github.com/Hillobar/Rope/assets/63615199/4b2ee574-c91e-4db2-ad66-5b775a049a6b)
+## Requirements
 
-### Updates for Rope-Pearl-00: ###
-### To update from Opal-03a, just need to replace the rope folder.
-* (feature) Selectable model swapping output resolution - 128, 256, 512
-* (feature) Better selection of input images (ctrl and shift modifiers work mostly like windows behavior)
-* (feature) Toggle between mean and median merging withou having to save to compare
-* (feature) Added back keyboard controls (q, w, a, s, d, space)
-* (feature) Gamma slider
-* 
-![image](https://github.com/Hillobar/Rope/assets/63615199/9d89fded-addb-46fe-b2d7-bfe6f1a88188)
+### Server machine (GPU)
+- NVIDIA GPU with CUDA 11.8
+- Python 3.10+
 
-### Performance:  ###
-Machine: 3090Ti (24GB), i5-13600K
+### Client machine
+- Python 3.10+
+- Webcam
+- No GPU required
 
-<img src="https://github.com/Hillobar/Rope/assets/63615199/3e3505db-bc76-48df-b8ac-1e7e86c8d751" width="200">
+---
 
-File: benchmark/target-1080p.mp4, 2048x1080, 269 frames, 25 fps, 10s
+## Model Files
 
-Rendering time in seconds (5 threads):
+Place the following ONNX model files in the `models/` directory on the **server**:
 
-| Option | Crystal | Sapphire | Ruby | Opal | Pearl |
-| --- | --- | --- | --- | --- | --- |
-| Only Swap (128) | 7.3 | 7.5 | 4.4 | 4.3 | 4.4 |
-| Swap (256) | --- | --- | --- | --- | 8.6 |
-| Swap (512) | --- | --- | --- | --- | 28.6 |
-| Swap+GFPGAN | 10.7 | 11.0 | 9.0 | 9.8 | 9.3 |
-| Swap+Codeformer | 12.4 | 13.5 | 11.1 | 11.1 | 11.3 |
-| Swap+one word CLIP | 10.4 | 11.2 | 9.1 | 9.3 | 9.3 |
-| Swap+Occluder | 7.8 | 7.8 | 4.4 | 4.7 | 4.7 |
-| Swap+MouthParser | 13.9 | 12.1 | 5.0 | 4.9 | 5.1 |
+| File | Required | Purpose |
+|------|----------|---------|
+| `inswapper_128.fp16.onnx` | Yes | Face swapper |
+| `det_10g.onnx` | Yes | Face detection |
+| `w600k_r50.onnx` | Yes | ArcFace recognition |
+| `GFPGANv1.4.onnx` | Optional | Face restoration |
+| `GPEN-BFR-512.onnx` | Optional | Face restoration |
+| `GPEN-BFR-256.onnx` | Optional | Face restoration |
+| `codeformer_fp16.onnx` | Optional | Face restoration |
+| `occluder.onnx` | Optional | Occlusion masking |
+| `faceparser_fp16.onnx` | Optional | Face parsing |
 
-### Disclaimer: ###
-Rope is a personal project that I'm making available to the community as a thank you for all of the contributors ahead of me.
-I've copied the disclaimer from [Swap-Mukham](https://github.com/harisreedhar/Swap-Mukham) here since it is well-written and applies 100% to this repo.
- 
-I would like to emphasize that our swapping software is intended for responsible and ethical use only. I must stress that users are solely responsible for their actions when using our software.
+These are the same models used by the original Rope GUI.
 
-Intended Usage: This software is designed to assist users in creating realistic and entertaining content, such as movies, visual effects, virtual reality experiences, and other creative applications. I encourage users to explore these possibilities within the boundaries of legality, ethical considerations, and respect for others' privacy.
+---
 
-Ethical Guidelines: Users are expected to adhere to a set of ethical guidelines when using our software. These guidelines include, but are not limited to:
+## Installation
 
-Not creating or sharing content that could harm, defame, or harass individuals. Obtaining proper consent and permissions from individuals featured in the content before using their likeness. Avoiding the use of this technology for deceptive purposes, including misinformation or malicious intent. Respecting and abiding by applicable laws, regulations, and copyright restrictions.
+### Server
+```bash
+git clone <repo>
+cd Rope
+pip install -r requirements.txt
+```
 
-Privacy and Consent: Users are responsible for ensuring that they have the necessary permissions and consents from individuals whose likeness they intend to use in their creations. We strongly discourage the creation of content without explicit consent, particularly if it involves non-consensual or private content. It is essential to respect the privacy and dignity of all individuals involved.
+### Client (separate machine)
+```bash
+git clone <repo>
+cd Rope
+pip install -r requirements_client.txt
+```
 
-Legal Considerations: Users must understand and comply with all relevant local, regional, and international laws pertaining to this technology. This includes laws related to privacy, defamation, intellectual property rights, and other relevant legislation. Users should consult legal professionals if they have any doubts regarding the legal implications of their creations.
+---
 
-Liability and Responsibility: We, as the creators and providers of the deep fake software, cannot be held responsible for the actions or consequences resulting from the usage of our software. Users assume full liability and responsibility for any misuse, unintended effects, or abusive behavior associated with the content they create.
+## Configuration
 
-By using this software, users acknowledge that they have read, understood, and agreed to abide by the above guidelines and disclaimers. We strongly encourage users to approach this technology with caution, integrity, and respect for the well-being and rights of others.
+Both `server.py` and `client.py` read from a `.env` file. Copy the example and fill in your values:
 
-Remember, technology should be used to empower and inspire, not to harm or deceive. Let's strive for ethical and responsible use of deep fake technology for the betterment of society.
+```bash
+cp .env.example .env
+```
 
+**`.env` on the server:**
+```ini
+HOST=0.0.0.0
+PORT=8765
+SOURCE_PATH=/path/to/source_face.jpg   # or a folder of images
+```
 
+**`.env` on the client:**
+```ini
+SERVER_URL=ws://SERVER_IP:8765/ws
+SOURCE_PATH=/path/to/source_face.jpg   # or a folder of images
+CAMERA_INDEX=0
+CAPTURE_WIDTH=1280
+CAPTURE_HEIGHT=720
+```
 
-  
+> `.env` is gitignored. Never commit it.
+
+CLI arguments override `.env` values if both are provided.
+
+---
+
+## Running
+
+### 1. Start the server
+
+```bash
+python server.py
+```
+
+Or with explicit arguments:
+```bash
+python server.py --source /path/to/source.jpg --host 0.0.0.0 --port 8765
+```
+
+You will see:
+```
+Loading models …
+Models ready.
+Source face loaded: 1/1 image(s) used
+Uvicorn running on http://0.0.0.0:8765
+```
+
+### 2. Test connectivity (from the client machine)
+
+```bash
+# HTTP health check
+curl http://SERVER_IP:8765/health
+# {"status":"ok","models_loaded":true,"source_face_loaded":true}
+
+# Browser status page + WebSocket ping test
+open http://SERVER_IP:8765/
+```
+
+### 3. Start the client
+
+```bash
+python client.py
+```
+
+Or with explicit arguments:
+```bash
+python client.py --server ws://SERVER_IP:8765/ws --source /path/to/source.jpg
+```
+
+A webcam preview window opens with the face swap applied in real time.
+
+---
+
+## Source Face
+
+The source face (the identity to swap onto detected faces) can be:
+
+- **A single image:** `--source /path/to/face.jpg`
+- **A folder of images of the same person:** `--source /path/to/folder/`
+
+When a folder is provided, the server computes an ArcFace embedding for each image and averages them, producing a more robust identity representation across different lighting and angles.
+
+The source can be set at server startup via `SOURCE_PATH` in `.env` or `--source`, or sent at runtime by the client.
+
+---
+
+## Client Controls
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `s` | Resend source face to server |
+| `r` | Toggle face restorer (GFPGAN) on/off |
+| `+` | Increase blend smoothing |
+| `-` | Decrease blend smoothing |
+
+---
+
+## Performance
+
+Server: 3090Ti (24GB), i5-13600K  
+Benchmark: `benchmark/target-1080p.mp4`, 2048×1080, 25 fps
+
+| Mode | Time (5 threads) |
+|------|-----------------|
+| Swap 128 | 4.4s |
+| Swap 256 | 8.6s |
+| Swap 512 | 28.6s |
+| Swap + GFPGAN | 9.3s |
+| Swap + CodeFormer | 11.3s |
+| Swap + Occluder | 4.7s |
+| Swap + MouthParser | 5.1s |
+
+---
+
+## Disclaimer
+
+Rope is intended for responsible and ethical use only. Users are solely responsible for their actions when using this software.
+
+Do not create or share content that could harm, defame, or harass individuals. Obtain proper consent from individuals before using their likeness. Do not use this technology for deceptive purposes. Respect applicable laws, regulations, and copyright restrictions.
+
+By using this software you agree to use it ethically and legally.
