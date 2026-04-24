@@ -82,9 +82,10 @@ from modules.processors.frame import face_enhancer_gpen256, face_enhancer_gpen51
 # ------------------------------------------------------------------ #
 # Globals                                                              #
 # ------------------------------------------------------------------ #
-_source_face = None   # insightface Face object
+_source_face = None      # insightface Face object
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-_verbose = False      # set by --verbose flag
+_verbose = False         # set by --verbose flag
+_prev_result_bgr: np.ndarray | None = None  # for temporal blending
 
 # ------------------------------------------------------------------ #
 # App                                                                  #
@@ -323,6 +324,14 @@ def _process_frame_sync(frame_bytes: bytes, source_face, params: dict) -> bytes 
                 result = face_enhancer_gpen512.enhance_face(result, face)
         if _verbose:
             print(f"[proc] enhance({enhance}) {(time.perf_counter()-t_enh)*1000:.1f}ms")
+
+    # Temporal blend with previous frame to suppress GAN flicker.
+    # 25% weight on the previous output keeps ghosting negligible while
+    # significantly damping per-pixel noise between consecutive frames.
+    global _prev_result_bgr
+    if _prev_result_bgr is not None and _prev_result_bgr.shape == result.shape:
+        result = cv2.addWeighted(result, 0.75, _prev_result_bgr, 0.25, 0)
+    _prev_result_bgr = result.copy()
 
     ok, buf = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None

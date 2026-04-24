@@ -76,13 +76,18 @@ def _collect_source_images(path: str) -> list[bytes]:
 # Shared display state                                                 #
 # ------------------------------------------------------------------ #
 
+# Cross-fade duration: how long to blend old→new swap result on arrival.
+_FADE_SECS = 0.12
+
 # Capture thread writes raw frames here at full camera FPS.
 _raw_lock = threading.Lock()
 _raw_frame: np.ndarray | None = None  # RGB
 
 # Receiver writes server-processed frames here.
 _swap_lock = threading.Lock()
-_swap_frame: np.ndarray | None = None  # RGB
+_swap_frame: np.ndarray | None = None       # latest swap result (RGB)
+_prev_swap_frame: np.ndarray | None = None  # swap result before the latest
+_swap_arrive_time: float | None = None      # monotonic time latest result arrived
 
 
 def _set_raw(frame_rgb: np.ndarray) -> None:
@@ -92,19 +97,37 @@ def _set_raw(frame_rgb: np.ndarray) -> None:
 
 
 def _set_swap(frame_rgb: np.ndarray) -> None:
-    global _swap_frame
+    global _swap_frame, _prev_swap_frame, _swap_arrive_time
     with _swap_lock:
+        _prev_swap_frame = _swap_frame
         _swap_frame = frame_rgb
+        _swap_arrive_time = time.monotonic()
 
 
-def _get_display_frame():
-    """Return (frame_rgb, is_swap). Prefers the latest swap result over raw."""
+def _get_display_frame() -> np.ndarray | None:
+    """Return the frame to display, cross-fading between the last two swap
+    results while a new one is settling in.  Falls back to raw if no swap
+    result has arrived yet."""
+    now = time.monotonic()
     with _swap_lock:
-        f = _swap_frame
-    if f is not None:
-        return f, True
-    with _raw_lock:
-        return _raw_frame, False
+        cur   = _swap_frame
+        prev  = _prev_swap_frame
+        arr_t = _swap_arrive_time
+
+    if cur is None:
+        with _raw_lock:
+            return _raw_frame
+
+    if prev is None or arr_t is None:
+        return cur
+
+    elapsed = now - arr_t
+    if elapsed >= _FADE_SECS:
+        return cur
+
+    # Linearly fade from prev → cur over _FADE_SECS.
+    alpha = elapsed / _FADE_SECS          # 0 at arrival → 1 when fade done
+    return cv2.addWeighted(cur, alpha, prev, 1.0 - alpha, 0)
 
 
 # ------------------------------------------------------------------ #
@@ -114,6 +137,9 @@ def _get_display_frame():
 _stats_lock = threading.Lock()
 _stats: dict = {"captured": 0, "sent": 0, "recv": 0, "roundtrips": []}
 _send_times: dict[int, float] = {}
+
+# Live stats exposed to the display overlay (written by stats thread).
+_live_stats: dict = {"swap_fps": 0.0, "rt_ms": 0.0}
 
 
 def _stats_printer():
@@ -129,11 +155,15 @@ def _stats_printer():
             _stats["recv"]       = 0
             _stats["roundtrips"] = []
 
-        rt_str = f"{sum(rts)/len(rts):.0f}ms" if rts else "—"
+        swap_fps = recv / 2.0
+        rt_ms = sum(rts) / len(rts) if rts else 0.0
+        _live_stats["swap_fps"] = swap_fps
+        _live_stats["rt_ms"] = rt_ms
+        rt_str = f"{rt_ms:.0f}ms" if rt_ms else "—"
         print(
             f"[client] capture={captured/2:.1f}fps  "
             f"sent={sent/2:.1f}fps  "
-            f"recv={recv/2:.1f}fps  "
+            f"swap={swap_fps:.1f}fps  "
             f"roundtrip={rt_str}"
         )
 
@@ -326,50 +356,36 @@ async def _receiver(ws):
 _ENHANCE_MODES = [None, "gpen256", "gpen512"]
 _ENHANCE_LABELS = {None: "off", "gpen256": "GPEN-256", "gpen512": "GPEN-512"}
 
+# waitKey delay sets the display update interval (~33ms ≈ 30fps).
+# The cross-fade animation needs the loop to run continuously even when
+# no new swap result has arrived, so we cannot gate imshow on object identity.
+_DISPLAY_INTERVAL_MS = 33
+
 
 def _display_loop(params_ref: dict, source_path_ref: list):
-    last_frame_obj = None
-    raw_fps_t = time.time()
-    swap_fps_t = time.time()
-    raw_count  = 0
-    swap_count = 0
-    raw_fps    = 0.0
-    swap_fps   = 0.0
-
     print("[display] q=quit  s=resend source  r=cycle enhance  m=mouth mask  +/-=opacity")
 
     while True:
-        frame, is_swap = _get_display_frame()
+        frame = _get_display_frame()
 
-        if frame is not None and frame is not last_frame_obj:
-            last_frame_obj = frame
-            now = time.time()
-
-            if is_swap:
-                swap_count += 1
-                if now - swap_fps_t >= 1.0:
-                    swap_fps   = swap_count / (now - swap_fps_t)
-                    swap_count = 0
-                    swap_fps_t = now
-            else:
-                raw_count += 1
-                if now - raw_fps_t >= 1.0:
-                    raw_fps   = raw_count / (now - raw_fps_t)
-                    raw_count = 0
-                    raw_fps_t = now
-
+        if frame is not None:
             display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
             enhance_label = _ENHANCE_LABELS[params_ref.get("enhance")]
-            mouth_on = params_ref.get("mouth_mask", False)
-            opacity = params_ref.get("opacity", 1.0)
-            cv2.putText(display, f"Raw {raw_fps:.0f}fps | Swap {swap_fps:.0f}fps",
+            mouth_on  = params_ref.get("mouth_mask", False)
+            opacity   = params_ref.get("opacity", 1.0)
+            swap_fps  = _live_stats["swap_fps"]
+            rt_ms     = _live_stats["rt_ms"]
+            rt_str    = f"{rt_ms:.0f}ms" if rt_ms else "—"
+
+            cv2.putText(display, f"Swap {swap_fps:.1f}fps  rt {rt_str}",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display,
                         f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}  Opacity: {opacity:.2f}",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
             cv2.imshow("Rope — Face Swap", display)
 
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(_DISPLAY_INTERVAL_MS) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('s'):
