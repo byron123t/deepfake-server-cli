@@ -13,17 +13,17 @@ Protocol (msgpack-serialised dicts):
 
   Client -> Server:
     { "type": "set_source", "images": [<bytes>, ...] }
-    { "type": "swap_frame",
+    { "type": "frame",
       "frame_id": int,
       "frame":   <bytes>,           # JPEG of full video frame
       "params":  { ... }            # optional
     }
 
   Server -> Client:
-    { "type": "source_set",    "success": bool, "faces_used": int, "images_sent": int }
+    { "type": "source_set",   "success": bool, "faces_used": int, "images_sent": int }
     { "type": "source_ready" }
-    { "type": "frame_result",  "frame_id": int, "frame": <bytes> }  # JPEG of processed frame
-    { "type": "error",         "message": str }
+    { "type": "frame_result", "frame_id": int, "frame": <bytes> }  # JPEG of processed frame
+    { "type": "error",        "message": str }
 """
 
 import argparse
@@ -54,7 +54,7 @@ _models: ModelsModule.Models | None = None
 _swap_core: SwapCore | None = None
 _startup_embedding: np.ndarray | None = None
 
-# Single-threaded executor: all GPU inference serialised here
+# Single-threaded executor: serialises all GPU inference
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # ------------------------------------------------------------------ #
@@ -135,7 +135,9 @@ async def websocket_endpoint(websocket: WebSocket):
     if source_embedding is not None:
         await _send(websocket, {"type": "source_ready"})
 
-    # Depth-1 queue: always process the most recent frame, drop stale ones
+    # Depth-1 queue: always process the most recent frame, drop stale ones.
+    # The client uses _in_flight semaphore so in practice only one frame is
+    # ever queued, but the drop logic protects us if that changes.
     frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     loop = asyncio.get_running_loop()
 
@@ -168,10 +170,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             "faces_used": n_ok, "images_sent": len(raw_list),
                         })
 
-                # -- swap_frame --------------------------------- #
-                elif mtype == "swap_frame":
+                # -- frame -------------------------------------- #
+                elif mtype == "frame":
                     if source_embedding is None:
-                        continue  # silently drop until source is set
+                        # Must still respond so the client releases _in_flight
+                        await _send(websocket, {
+                            "type": "error",
+                            "message": "No source face set. Send set_source first.",
+                        })
+                        continue
+
                     item = (
                         msg.get("frame_id", 0),
                         msg.get("frame"),
@@ -208,7 +216,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 frame_queue.put_nowait(None)
 
     # ---------------------------------------------------------- #
-    # Processor: runs GPU inference for one frame at a time       #
+    # Processor: GPU inference, one frame at a time               #
     # ---------------------------------------------------------- #
     async def _proc_loop():
         while True:
@@ -225,8 +233,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         "frame_id": frame_id,
                         "frame": result_bytes,
                     })
+                else:
+                    # Decode failed — client must still release _in_flight
+                    await _send(websocket, {
+                        "type": "error",
+                        "message": "Failed to decode frame.",
+                    })
             except Exception as exc:
                 print(f"[PROC] {exc}")
+                try:
+                    await _send(websocket, {
+                        "type": "error",
+                        "message": str(exc),
+                    })
+                except Exception:
+                    pass
 
     recv_task = asyncio.create_task(_recv_loop())
     proc_task = asyncio.create_task(_proc_loop())
@@ -239,12 +260,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ------------------------------------------------------------------ #
-# Synchronous GPU processing (runs in the thread-pool executor)       #
+# Synchronous GPU processing (runs inside the thread-pool executor)   #
 # ------------------------------------------------------------------ #
 
 def _process_frame_sync(frame_bytes: bytes, source_embedding: np.ndarray,
                         params: dict) -> bytes | None:
-    """Decode JPEG, swap faces on GPU, re-encode to JPEG."""
+    """Decode JPEG, detect + swap faces on GPU, re-encode to JPEG."""
     nparr = np.frombuffer(frame_bytes, np.uint8)
     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame_bgr is None:
