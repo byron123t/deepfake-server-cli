@@ -74,25 +74,77 @@ def _collect_source_images(path: str) -> list[bytes]:
 # ------------------------------------------------------------------ #
 # Shared display state                                                 #
 # ------------------------------------------------------------------ #
-_frame_q: queue.Queue = queue.Queue(maxsize=2)
 
-_display_lock = threading.Lock()
-_display_frame: np.ndarray | None = None  # RGB
+# Capture thread writes raw frames here at full camera FPS.
+_raw_lock = threading.Lock()
+_raw_frame: np.ndarray | None = None  # RGB
 
-
-def _set_display(frame: np.ndarray) -> None:
-    global _display_frame
-    with _display_lock:
-        _display_frame = frame
+# Receiver writes server-processed frames here.
+_swap_lock = threading.Lock()
+_swap_frame: np.ndarray | None = None  # RGB
 
 
-def _get_display() -> np.ndarray | None:
-    with _display_lock:
-        return _display_frame
+def _set_raw(frame_rgb: np.ndarray) -> None:
+    global _raw_frame
+    with _raw_lock:
+        _raw_frame = frame_rgb
+
+
+def _set_swap(frame_rgb: np.ndarray) -> None:
+    global _swap_frame
+    with _swap_lock:
+        _swap_frame = frame_rgb
+
+
+def _get_display_frame():
+    """Return (frame_rgb, is_swap). Prefers the latest swap result over raw."""
+    with _swap_lock:
+        f = _swap_frame
+    if f is not None:
+        return f, True
+    with _raw_lock:
+        return _raw_frame, False
 
 
 # ------------------------------------------------------------------ #
-# Capture thread — raw BGR frames only, no processing                 #
+# Stats (terminal debug)                                               #
+# ------------------------------------------------------------------ #
+
+_stats_lock = threading.Lock()
+_stats: dict = {"captured": 0, "sent": 0, "recv": 0, "roundtrips": []}
+_send_times: dict[int, float] = {}
+
+
+def _stats_printer():
+    while True:
+        time.sleep(2.0)
+        with _stats_lock:
+            captured  = _stats["captured"]
+            sent      = _stats["sent"]
+            recv      = _stats["recv"]
+            rts       = _stats["roundtrips"][:]
+            _stats["captured"]   = 0
+            _stats["sent"]       = 0
+            _stats["recv"]       = 0
+            _stats["roundtrips"] = []
+
+        rt_str = f"{sum(rts)/len(rts):.0f}ms" if rts else "—"
+        print(
+            f"[client] capture={captured/2:.1f}fps  "
+            f"sent={sent/2:.1f}fps  "
+            f"recv={recv/2:.1f}fps  "
+            f"roundtrip={rt_str}"
+        )
+
+
+# ------------------------------------------------------------------ #
+# Frame queue (raw BGR) for the sender                                 #
+# ------------------------------------------------------------------ #
+_frame_q: queue.Queue = queue.Queue(maxsize=2)
+
+
+# ------------------------------------------------------------------ #
+# Capture thread — raw BGR frames, no processing                      #
 # ------------------------------------------------------------------ #
 
 def _capture_thread(camera_id: int, width: int, height: int):
@@ -103,11 +155,19 @@ def _capture_thread(camera_id: int, width: int, height: int):
         print(f"[ERROR] Cannot open camera {camera_id}")
         return
 
-    print(f"Camera {camera_id} opened at {width}x{height}")
+    print(f"[capture] Camera {camera_id} opened at {width}x{height}")
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
+
+        # Always update the raw display so the preview is smooth at camera FPS.
+        _set_raw(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+        with _stats_lock:
+            _stats["captured"] += 1
+
+        # Drop oldest frame if sender hasn't caught up.
         if _frame_q.full():
             try:
                 _frame_q.get_nowait()
@@ -122,8 +182,8 @@ def _capture_thread(camera_id: int, width: int, height: int):
 # Async WebSocket client                                               #
 # ------------------------------------------------------------------ #
 
-# Limits to one frame in-flight at a time so we always send the freshest
-# frame and never build up a stale backlog.
+# One frame in-flight at a time: ensures we always send the freshest
+# available frame and never build a stale backlog.
 _in_flight: asyncio.Semaphore | None = None
 
 
@@ -131,9 +191,9 @@ async def _ws_client(uri: str, source_path: str, params_ref: dict):
     global _in_flight
     _in_flight = asyncio.Semaphore(1)
 
-    print(f"Connecting to {uri} …")
+    print(f"[ws] Connecting to {uri} …")
     async with websockets.connect(uri, max_size=20 * 1024 * 1024) as ws:
-        print("Connected.")
+        print("[ws] Connected.")
         _ws_ref.append(ws)
 
         if source_path:
@@ -153,7 +213,7 @@ async def _send_source(ws, path: str):
         return
     await ws.send(msgpack.packb({"type": "set_source", "images": images}, use_bin_type=True))
     label = f"{len(images)} image(s)" if len(images) > 1 else "1 image"
-    print(f"Source face sent: {label} from {path}")
+    print(f"[source] Sent {label} from {path}")
 
 
 async def _sender(ws, params_ref: dict):
@@ -161,7 +221,7 @@ async def _sender(ws, params_ref: dict):
     frame_id = 0
     while True:
         # Wait for the server to finish the previous frame before grabbing
-        # the next one — this keeps the queue flushed to the freshest frame.
+        # the next one — this keeps _frame_q flushed to the freshest frame.
         await _in_flight.acquire()
 
         try:
@@ -171,13 +231,23 @@ async def _sender(ws, params_ref: dict):
             _in_flight.release()
             continue
 
-        # Show raw frame immediately so the preview never freezes.
-        _set_display(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        # Downscale + encode in a thread so the event loop stays free.
+        def _encode(bgr):
+            if _send_scale < 1.0:
+                h, w = bgr.shape[:2]
+                bgr = cv2.resize(bgr,
+                                 (max(1, int(w * _send_scale)),
+                                  max(1, int(h * _send_scale))),
+                                 interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, _send_quality])
+            return (ok, buf)
 
-        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        ok, buf = await loop.run_in_executor(None, lambda: _encode(frame_bgr))
         if not ok:
             _in_flight.release()
             continue
+
+        _send_times[frame_id] = time.time()
 
         payload = msgpack.packb({
             "type": "frame",
@@ -186,6 +256,11 @@ async def _sender(ws, params_ref: dict):
             "frame": buf.tobytes(),
         }, use_bin_type=True)
         await ws.send(payload)
+
+        with _stats_lock:
+            _stats["sent"] += 1
+
+        print(f"[send] frame {frame_id}  size={len(buf)/1024:.1f}KB")
         frame_id += 1
 
 
@@ -195,18 +270,43 @@ async def _receiver(ws):
         mtype = msg.get("type")
 
         if mtype == "frame_result":
+            fid = msg.get("frame_id", -1)
             frame_bytes = msg.get("frame")
+
             if frame_bytes:
+                # Decode + upscale in a thread so the event loop stays free.
                 nparr = np.frombuffer(frame_bytes, np.uint8)
-                result_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if result_bgr is not None:
-                    _set_display(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
+
+                def _decode(arr):
+                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        return None
+                    if _send_scale < 1.0 and _capture_size:
+                        bgr = cv2.resize(bgr, _capture_size,
+                                         interpolation=cv2.INTER_LINEAR)
+                    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+                loop = asyncio.get_event_loop()
+                result_rgb = await loop.run_in_executor(None, lambda: _decode(nparr))
+                if result_rgb is not None:
+                    _set_swap(result_rgb)
+
+            sent_t = _send_times.pop(fid, None)
+            rt_ms = (time.time() - sent_t) * 1000 if sent_t else 0.0
+
+            with _stats_lock:
+                _stats["recv"] += 1
+                if sent_t:
+                    _stats["roundtrips"].append(rt_ms)
+
+            print(f"[recv] frame {fid}  size={len(frame_bytes)/1024:.1f}KB  rt={rt_ms:.0f}ms")
+
             if _in_flight:
                 _in_flight.release()
 
         elif mtype == "source_set":
             if msg.get("success"):
-                n_ok = msg.get("faces_used", "?")
+                n_ok  = msg.get("faces_used", "?")
                 n_sent = msg.get("images_sent", "?")
                 print(f"[source_set] OK — {n_ok}/{n_sent} image(s) had a detectable face")
             else:
@@ -226,30 +326,42 @@ async def _receiver(ws):
 # ------------------------------------------------------------------ #
 
 def _display_loop(params_ref: dict, source_path_ref: list):
-    fps_t = time.time()
-    fps_count = 0
-    fps_display = 0.0
+    last_frame_obj = None
+    raw_fps_t = time.time()
+    swap_fps_t = time.time()
+    raw_count  = 0
+    swap_count = 0
+    raw_fps    = 0.0
+    swap_fps   = 0.0
 
-    print("Display started. Press 'q' to quit, 's' to resend source, 'r' to toggle restorer.")
+    print("[display] Started. Press 'q' to quit, 's' to resend source, 'r' to toggle restorer.")
 
     while True:
-        frame = _get_display()
+        frame, is_swap = _get_display_frame()
 
-        if frame is not None:
-            display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            fps_count += 1
+        if frame is not None and frame is not last_frame_obj:
+            last_frame_obj = frame
             now = time.time()
-            if now - fps_t >= 1.0:
-                fps_display = fps_count / (now - fps_t)
-                fps_count = 0
-                fps_t = now
 
+            if is_swap:
+                swap_count += 1
+                if now - swap_fps_t >= 1.0:
+                    swap_fps   = swap_count / (now - swap_fps_t)
+                    swap_count = 0
+                    swap_fps_t = now
+            else:
+                raw_count += 1
+                if now - raw_fps_t >= 1.0:
+                    raw_fps   = raw_count / (now - raw_fps_t)
+                    raw_count = 0
+                    raw_fps_t = now
+
+            display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             restorer_on = params_ref.get("RestorerSwitch", False)
-            cv2.putText(display, f"FPS: {fps_display:.1f}", (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(display, f"Restorer: {'ON' if restorer_on else 'OFF'}", (10, 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            cv2.putText(display, f"Raw {raw_fps:.0f}fps | Swap {swap_fps:.0f}fps",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display, f"Restorer: {'ON' if restorer_on else 'OFF'}",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
             cv2.imshow("Rope — Face Swap", display)
 
         key = cv2.waitKey(1) & 0xFF
@@ -262,11 +374,13 @@ def _display_loop(params_ref: dict, source_path_ref: list):
                     _ws_loop)
         elif key == ord('r'):
             params_ref["RestorerSwitch"] = not params_ref.get("RestorerSwitch", False)
-            print(f"Restorer: {'ON' if params_ref['RestorerSwitch'] else 'OFF'}")
+            print(f"[params] Restorer: {'ON' if params_ref['RestorerSwitch'] else 'OFF'}")
         elif key == ord('+'):
             params_ref["BlendSlider"] = min(params_ref.get("BlendSlider", 5) + 1, 20)
+            print(f"[params] BlendSlider: {params_ref['BlendSlider']}")
         elif key == ord('-'):
             params_ref["BlendSlider"] = max(params_ref.get("BlendSlider", 5) - 1, 0)
+            print(f"[params] BlendSlider: {params_ref['BlendSlider']}")
 
     cv2.destroyAllWindows()
 
@@ -299,9 +413,14 @@ def _pick_source_face() -> str:
 _ws_loop: asyncio.AbstractEventLoop | None = None
 _ws_ref: list = []
 
+# Set by main() before threads start — used by sender/receiver.
+_send_scale: float = 0.5
+_send_quality: int = 60
+_capture_size: tuple[int, int] | None = None  # (width, height) for upscaling results
+
 
 def main():
-    global _ws_loop, _ws_ref
+    global _ws_loop, _ws_ref, _send_scale, _send_quality, _capture_size
 
     parser = argparse.ArgumentParser(
         description="Rope face-swap client",
@@ -317,7 +436,18 @@ def main():
                         help="Capture width (env: CAPTURE_WIDTH)")
     parser.add_argument("--height", type=int, default=int(os.getenv("CAPTURE_HEIGHT", "720")),
                         help="Capture height (env: CAPTURE_HEIGHT)")
+    parser.add_argument("--send-scale", type=float, default=float(os.getenv("SEND_SCALE", "0.5")),
+                        help="Downscale factor for frames sent to server (env: SEND_SCALE)")
+    parser.add_argument("--send-quality", type=int, default=int(os.getenv("SEND_QUALITY", "60")),
+                        help="JPEG quality for frames sent to server (env: SEND_QUALITY)")
     args = parser.parse_args()
+
+    _send_scale   = max(0.1, min(1.0, args.send_scale))
+    _send_quality = max(1,   min(100, args.send_quality))
+    _capture_size = (args.width, args.height)
+
+    print(f"[config] send_scale={_send_scale}  send_quality={_send_quality}  "
+          f"capture={args.width}x{args.height}")
 
     if not args.source:
         args.source = _pick_source_face()
@@ -330,6 +460,9 @@ def main():
                                   daemon=True)
     cap_thread.start()
 
+    stats_thread = threading.Thread(target=_stats_printer, daemon=True)
+    stats_thread.start()
+
     def _run_ws():
         global _ws_loop
         _ws_loop = asyncio.new_event_loop()
@@ -337,7 +470,7 @@ def main():
         try:
             _ws_loop.run_until_complete(_ws_client(args.server, args.source, params_ref))
         except Exception as e:
-            print(f"[WS] Disconnected: {e}")
+            print(f"[ws] Disconnected: {e}")
 
     ws_thread = threading.Thread(target=_run_ws, daemon=True)
     ws_thread.start()
