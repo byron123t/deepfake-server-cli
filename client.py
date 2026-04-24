@@ -16,8 +16,9 @@ Usage:
 Keys:
     q    - quit
     s    - resend source to server
-    r    - toggle face restoration on server (GFPGAN)
-    +/-  - increase/decrease blend smoothing
+    r    - cycle enhance mode: off → GPEN-256 → GPEN-512 → off
+    m    - toggle mouth mask
+    +/-  - opacity up / down (0.05 steps)
 """
 
 import argparse
@@ -260,7 +261,6 @@ async def _sender(ws, params_ref: dict):
         with _stats_lock:
             _stats["sent"] += 1
 
-        print(f"[send] frame {frame_id}  size={len(buf)/1024:.1f}KB")
         frame_id += 1
 
 
@@ -299,8 +299,6 @@ async def _receiver(ws):
                 if sent_t:
                     _stats["roundtrips"].append(rt_ms)
 
-            print(f"[recv] frame {fid}  size={len(frame_bytes)/1024:.1f}KB  rt={rt_ms:.0f}ms")
-
             if _in_flight:
                 _in_flight.release()
 
@@ -325,6 +323,10 @@ async def _receiver(ws):
 # Display loop (main thread)                                           #
 # ------------------------------------------------------------------ #
 
+_ENHANCE_MODES = [None, "gpen256", "gpen512"]
+_ENHANCE_LABELS = {None: "off", "gpen256": "GPEN-256", "gpen512": "GPEN-512"}
+
+
 def _display_loop(params_ref: dict, source_path_ref: list):
     last_frame_obj = None
     raw_fps_t = time.time()
@@ -334,7 +336,7 @@ def _display_loop(params_ref: dict, source_path_ref: list):
     raw_fps    = 0.0
     swap_fps   = 0.0
 
-    print("[display] Started. Press 'q' to quit, 's' to resend source, 'r' to toggle restorer.")
+    print("[display] q=quit  s=resend source  r=cycle enhance  m=mouth mask  +/-=opacity")
 
     while True:
         frame, is_swap = _get_display_frame()
@@ -357,11 +359,14 @@ def _display_loop(params_ref: dict, source_path_ref: list):
                     raw_fps_t = now
 
             display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            restorer_on = params_ref.get("RestorerSwitch", False)
+            enhance_label = _ENHANCE_LABELS[params_ref.get("enhance")]
+            mouth_on = params_ref.get("mouth_mask", False)
+            opacity = params_ref.get("opacity", 1.0)
             cv2.putText(display, f"Raw {raw_fps:.0f}fps | Swap {swap_fps:.0f}fps",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display, f"Restorer: {'ON' if restorer_on else 'OFF'}",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            cv2.putText(display,
+                        f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}  Opacity: {opacity:.2f}",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
             cv2.imshow("Rope — Face Swap", display)
 
         key = cv2.waitKey(1) & 0xFF
@@ -373,14 +378,19 @@ def _display_loop(params_ref: dict, source_path_ref: list):
                     _send_source(_ws_ref[0], source_path_ref[0]),
                     _ws_loop)
         elif key == ord('r'):
-            params_ref["RestorerSwitch"] = not params_ref.get("RestorerSwitch", False)
-            print(f"[params] Restorer: {'ON' if params_ref['RestorerSwitch'] else 'OFF'}")
+            cur = params_ref.get("enhance")
+            nxt = _ENHANCE_MODES[(_ENHANCE_MODES.index(cur) + 1) % len(_ENHANCE_MODES)]
+            params_ref["enhance"] = nxt
+            print(f"[params] enhance: {_ENHANCE_LABELS[nxt]}")
+        elif key == ord('m'):
+            params_ref["mouth_mask"] = not params_ref.get("mouth_mask", False)
+            print(f"[params] mouth_mask: {'on' if params_ref['mouth_mask'] else 'off'}")
         elif key == ord('+'):
-            params_ref["BlendSlider"] = min(params_ref.get("BlendSlider", 5) + 1, 20)
-            print(f"[params] BlendSlider: {params_ref['BlendSlider']}")
+            params_ref["opacity"] = round(min(params_ref.get("opacity", 1.0) + 0.05, 1.0), 2)
+            print(f"[params] opacity: {params_ref['opacity']:.2f}")
         elif key == ord('-'):
-            params_ref["BlendSlider"] = max(params_ref.get("BlendSlider", 5) - 1, 0)
-            print(f"[params] BlendSlider: {params_ref['BlendSlider']}")
+            params_ref["opacity"] = round(max(params_ref.get("opacity", 1.0) - 0.05, 0.0), 2)
+            print(f"[params] opacity: {params_ref['opacity']:.2f}")
 
     cv2.destroyAllWindows()
 
@@ -452,7 +462,7 @@ def main():
     if not args.source:
         args.source = _pick_source_face()
 
-    params_ref: dict = {}
+    params_ref: dict = {"enhance": None, "mouth_mask": False, "opacity": 1.0}
     source_path_ref: list = [args.source]
 
     cap_thread = threading.Thread(target=_capture_thread,

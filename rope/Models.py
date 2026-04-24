@@ -11,7 +11,7 @@ import onnxruntime
 import onnx
 from itertools import product as product
 import subprocess as sp
-onnxruntime.set_default_logger_severity(4)
+onnxruntime.set_default_logger_severity(3)
 
 class Models():
     def __init__(self):
@@ -39,10 +39,13 @@ class Models():
         self.occluder_model = []
         self.faceparser_model = []
 
+        self._latent_cache: tuple | None = None  # (embedding_bytes, latent)
+
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
         available = onnxruntime.get_available_providers()
         print(f"[ORT] Available providers: {available}")
-        if 'CUDAExecutionProvider' not in available:
+        self.cuda_available = 'CUDAExecutionProvider' in available
+        if not self.cuda_available:
             print("[ORT] WARNING: CUDAExecutionProvider not available — ONNX will run on CPU")
 
     def get_gpu_memory(self):
@@ -58,12 +61,43 @@ class Models():
 
         return memory_used, memory_total[0]
 
+    def _make_session(self, path: str) -> onnxruntime.InferenceSession:
+        sess = onnxruntime.InferenceSession(path, providers=self.providers)
+        print(f"[ORT] {path.split('/')[-1]} → {sess.get_providers()}")
+        return sess
+
+    def _gpu_run(self, session, inputs: dict, output_names=None) -> list:
+        """Run ONNX session with ORT-managed CUDA tensors; falls back to CPU numpy on failure."""
+        if not self.cuda_available:
+            return session.run(output_names, inputs)
+        try:
+            io_binding = session.io_binding()
+            ort_inputs = []
+            for name, arr in inputs.items():
+                if not isinstance(arr, np.ndarray):
+                    arr = np.array(arr, dtype=np.float32)
+                if not arr.flags['C_CONTIGUOUS']:
+                    arr = np.ascontiguousarray(arr)
+                ort_val = onnxruntime.OrtValue.ortvalue_from_numpy(arr, 'cuda', 0)
+                ort_inputs.append(ort_val)
+                io_binding.bind_ortvalue_input(name, ort_val)
+            if output_names is None:
+                output_names = [o.name for o in session.get_outputs()]
+            for name in output_names:
+                io_binding.bind_output(name, 'cuda')
+            session.run_with_iobinding(io_binding)
+            return io_binding.copy_outputs_to_cpu()
+        except Exception as e:
+            print(f"[ORT] GPU run failed ({type(e).__name__}: {e}), falling back to CPU")
+            self.cuda_available = False
+            return session.run(output_names, inputs)
+
     def run_detect(self, img, detect_mode='Retinaface', max_num=1, score=0.5):
         kpss = []
 
         if detect_mode=='Retinaface':
             if not self.retinaface_model:
-                self.retinaface_model = onnxruntime.InferenceSession('./models/det_10g.onnx', providers=self.providers)
+                self.retinaface_model = self._make_session('./models/det_10g.onnx')
 
             kpss = self.detect_retinaface(img, max_num=max_num, score=score)
 
@@ -106,7 +140,7 @@ class Models():
 
     def run_recognize(self, img, kps):
         if not self.recognition_model:
-            self.recognition_model = onnxruntime.InferenceSession('./models/w600k_r50.onnx', providers=self.providers)
+            self.recognition_model = self._make_session('./models/w600k_r50.onnx')
 
         embedding, cropped_image = self.recognize(img, kps)
         return embedding, cropped_image
@@ -117,19 +151,24 @@ class Models():
             graph = onnx.load("./models/inswapper_128.fp16.onnx").graph
             self.emap = onnx.numpy_helper.to_array(graph.initializer[-1])
 
+        key = source_embedding.tobytes()
+        if self._latent_cache is not None and self._latent_cache[0] == key:
+            return self._latent_cache[1]
+
         n_e = source_embedding / l2norm(source_embedding)
         latent = n_e.reshape((1,-1))
         latent = np.dot(latent, self.emap)
         latent /= np.linalg.norm(latent)
+        self._latent_cache = (key, latent)
         return latent
 
     def run_swapper(self, image, embedding, output):
         if not self.swapper_model:
-            self.swapper_model = onnxruntime.InferenceSession("./models/inswapper_128.fp16.onnx", providers=self.providers)
+            self.swapper_model = self._make_session("./models/inswapper_128.fp16.onnx")
 
-        image_np = image.cpu().float().numpy()
-        embedding_np = embedding.cpu().float().numpy()
-        result = self.swapper_model.run(['output'], {'target': image_np, 'source': embedding_np})
+        image_np = np.ascontiguousarray(image.cpu().float().numpy())
+        embedding_np = np.ascontiguousarray(embedding.cpu().float().numpy())
+        result = self._gpu_run(self.swapper_model, {'target': image_np, 'source': embedding_np}, ['output'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def run_swap_stg1(self, embedding):
@@ -198,21 +237,21 @@ class Models():
         if not self.GFPGAN_model:
             self.GFPGAN_model = onnxruntime.InferenceSession("./models/GFPGANv1.4.onnx", providers=self.providers)
 
-        result = self.GFPGAN_model.run(['output'], {'input': image.cpu().numpy()})
+        result = self._gpu_run(self.GFPGAN_model, {'input': np.ascontiguousarray(image.cpu().numpy())}, ['output'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def run_GPEN_512(self, image, output):
         if not self.GPEN_512_model:
             self.GPEN_512_model = onnxruntime.InferenceSession("./models/GPEN-BFR-512.onnx", providers=self.providers)
 
-        result = self.GPEN_512_model.run(['output'], {'input': image.cpu().numpy()})
+        result = self._gpu_run(self.GPEN_512_model, {'input': np.ascontiguousarray(image.cpu().numpy())}, ['output'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def run_GPEN_256(self, image, output):
         if not self.GPEN_256_model:
             self.GPEN_256_model = onnxruntime.InferenceSession("./models/GPEN-BFR-256.onnx", providers=self.providers)
 
-        result = self.GPEN_256_model.run(['output'], {'input': image.cpu().numpy()})
+        result = self._gpu_run(self.GPEN_256_model, {'input': np.ascontiguousarray(image.cpu().numpy())}, ['output'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def run_codeformer(self, image, output):
@@ -220,21 +259,21 @@ class Models():
             self.codeformer_model = onnxruntime.InferenceSession("./models/codeformer_fp16.onnx", providers=self.providers)
 
         w = np.array([0.9], dtype=np.double)
-        result = self.codeformer_model.run(['y'], {'x': image.cpu().numpy(), 'w': w})
+        result = self._gpu_run(self.codeformer_model, {'x': np.ascontiguousarray(image.cpu().numpy()), 'w': w}, ['y'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def run_occluder(self, image, output):
         if not self.occluder_model:
             self.occluder_model = onnxruntime.InferenceSession("./models/occluder.onnx", providers=self.providers)
 
-        result = self.occluder_model.run(['output'], {'img': image.cpu().numpy()})
+        result = self._gpu_run(self.occluder_model, {'img': np.ascontiguousarray(image.cpu().numpy())}, ['output'])
         output.copy_(torch.from_numpy(result[0]).reshape(output.shape).to(output.device))
 
     def run_faceparser(self, image, output):
         if not self.faceparser_model:
             self.faceparser_model = onnxruntime.InferenceSession("./models/faceparser_fp16.onnx", providers=self.providers)
 
-        result = self.faceparser_model.run(['out'], {'input': image.cpu().numpy()})
+        result = self._gpu_run(self.faceparser_model, {'input': np.ascontiguousarray(image.cpu().numpy())}, ['out'])
         output.copy_(torch.from_numpy(result[0]).to(output.device))
 
     def detect_retinaface(self, img, max_num, score):
@@ -262,7 +301,7 @@ class Models():
         det_img = det_img.permute(2, 0, 1)
         det_img = torch.unsqueeze(det_img, 0).contiguous()
 
-        net_outs = self.retinaface_model.run(None, {'input.1': det_img.cpu().numpy()})
+        net_outs = self._gpu_run(self.retinaface_model, {'input.1': np.ascontiguousarray(det_img.cpu().numpy())})
 
         input_height = det_img.shape[2]
         input_width = det_img.shape[3]
@@ -389,7 +428,7 @@ class Models():
         det_img = det_img.permute(2, 0, 1)
         det_img = torch.unsqueeze(det_img, 0).contiguous()
         input_name = self.scrdf_model.get_inputs()[0].name
-        net_outs = self.scrdf_model.run(None, {input_name: det_img.cpu().numpy()})
+        net_outs = self._gpu_run(self.scrdf_model, {input_name: np.ascontiguousarray(det_img.cpu().numpy())})
 
         input_height = det_img.shape[2]
         input_width = det_img.shape[3]
@@ -556,7 +595,7 @@ class Models():
         img = torch.unsqueeze(img, 0)
 
         input_name = self.recognition_model.get_inputs()[0].name
-        result = self.recognition_model.run(None, {input_name: img.cpu().numpy()})
+        result = self._gpu_run(self.recognition_model, {input_name: np.ascontiguousarray(img.cpu().numpy())})
         return np.array(result).flatten(), cropped_image
 
     def resnet50(self, image, score=.5):

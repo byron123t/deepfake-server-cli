@@ -1,8 +1,8 @@
 """
-Rope Face-Swap API Server
-=========================
-Receives full JPEG frames from a client over WebSocket, runs face detection +
-inswapper GAN + optional restorer on GPU, and streams swapped frames back.
+Rope Face-Swap API Server (Deep-Live-Cam backend)
+==================================================
+Receives full JPEG frames from a client over WebSocket, runs insightface
+face detection + inswapper on GPU, and streams swapped frames back.
 
 Usage:
     python server.py --source /path/to/source_face.jpg [--host 0.0.0.0] [--port 8765]
@@ -13,16 +13,18 @@ Protocol (msgpack-serialised dicts):
 
   Client -> Server:
     { "type": "set_source", "images": [<bytes>, ...] }
-    { "type": "frame",
-      "frame_id": int,
-      "frame":   <bytes>,           # JPEG of full video frame
-      "params":  { ... }            # optional
-    }
+    { "type": "frame", "frame_id": int, "frame": <bytes>, "params": { ... } }
+
+    Supported params keys:
+      enhance    : null | "gpen256" | "gpen512"   — face restoration model
+      opacity    : float 0–1                       — blend strength (default 1.0)
+      mouth_mask : bool                            — preserve original mouth (default false)
+      sharpness  : float 0+                        — post-swap sharpening (default 0.0)
 
   Server -> Client:
     { "type": "source_set",   "success": bool, "faces_used": int, "images_sent": int }
     { "type": "source_ready" }
-    { "type": "frame_result", "frame_id": int, "frame": <bytes> }  # JPEG of processed frame
+    { "type": "frame_result", "frame_id": int, "frame": <bytes> }
     { "type": "error",        "message": str }
 """
 
@@ -32,9 +34,24 @@ import concurrent.futures
 import glob
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# Preload libcudnn.so.9 so ORT's CUDA provider can dlopen it.
+# nvidia-cudnn-cu12 installs it under site-packages/nvidia/cudnn/lib/ which the
+# dynamic linker won't search without an explicit preload.
+import ctypes as _ctypes, site as _site
+for _sp in _site.getsitepackages() + [_site.getusersitepackages()]:
+    _cudnn = os.path.join(_sp, "nvidia", "cudnn", "lib", "libcudnn.so.9")
+    if os.path.exists(_cudnn):
+        try:
+            _ctypes.CDLL(_cudnn, _ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+        break
+del _ctypes, _site
 
 import cv2
 import msgpack
@@ -43,19 +60,31 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+# ------------------------------------------------------------------ #
+# Bootstrap DLC modules                                                #
+# ------------------------------------------------------------------ #
 sys.path.insert(0, os.path.dirname(__file__))
-import rope.Models as ModelsModule
-from rope.SwapCore import SwapCore, DEFAULT_PARAMS
+
+import modules.globals
+modules.globals.headless = True
+modules.globals.execution_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+modules.globals.many_faces = True
+modules.globals.mouth_mask = False
+modules.globals.opacity = 1.0
+modules.globals.sharpness = 0.0
+modules.globals.enable_interpolation = False
+modules.globals.poisson_blend = False
+
+from modules.face_analyser import get_one_face, get_many_faces
+from modules.processors.frame.face_swapper import swap_face, get_face_swapper
+from modules.processors.frame import face_enhancer_gpen256, face_enhancer_gpen512
 
 # ------------------------------------------------------------------ #
 # Globals                                                              #
 # ------------------------------------------------------------------ #
-_models: ModelsModule.Models | None = None
-_swap_core: SwapCore | None = None
-_startup_embedding: np.ndarray | None = None
-
-# Single-threaded executor: serialises all GPU inference
+_source_face = None   # insightface Face object
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_verbose = False      # set by --verbose flag
 
 # ------------------------------------------------------------------ #
 # App                                                                  #
@@ -65,10 +94,9 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
-    global _models, _swap_core, _startup_embedding
+    global _source_face
     print("Loading models …")
-    _models = ModelsModule.Models()
-    _swap_core = SwapCore(_models)
+    get_face_swapper()
     print("Models ready.")
 
     if _args.source:
@@ -77,21 +105,20 @@ async def _startup():
             print(f"[WARN] No readable images found at: {_args.source}")
         else:
             loop = asyncio.get_running_loop()
-            emb, n_ok = await loop.run_in_executor(
-                _executor, _compute_averaged_embedding, raw_images)
-            if emb is None:
-                print(f"[WARN] No face detected in {len(raw_images)} source image(s).")
+            face = await loop.run_in_executor(_executor, _detect_source_face, raw_images)
+            if face is None:
+                print(f"[WARN] No face detected in source image(s): {_args.source}")
             else:
-                _startup_embedding = emb
-                print(f"Source face loaded: {n_ok}/{len(raw_images)} image(s) from {_args.source}")
+                _source_face = face
+                print(f"Source face loaded from {_args.source}")
 
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "models_loaded": _swap_core is not None,
-        "source_face_loaded": _startup_embedding is not None,
+        "models_loaded": get_face_swapper() is not None,
+        "source_face_loaded": _source_face is not None,
     }
 
 
@@ -130,50 +157,48 @@ function pingWS() {
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    client = websocket.client
+    print(f"[WS] client connected: {client.host}:{client.port}")
 
-    source_embedding: np.ndarray | None = _startup_embedding
-    if source_embedding is not None:
+    source_face = _source_face
+    if source_face is not None:
         await _send(websocket, {"type": "source_ready"})
 
-    # Depth-1 queue: always process the most recent frame, drop stale ones.
-    # The client uses _in_flight semaphore so in practice only one frame is
-    # ever queued, but the drop logic protects us if that changes.
     frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     loop = asyncio.get_running_loop()
 
-    # ---------------------------------------------------------- #
-    # Receiver: reads WebSocket messages as fast as they arrive   #
-    # ---------------------------------------------------------- #
     async def _recv_loop():
-        nonlocal source_embedding
+        nonlocal source_face
         try:
             while True:
                 raw = await websocket.receive_bytes()
                 msg = msgpack.unpackb(raw, raw=False)
                 mtype = msg.get("type")
 
-                # -- set_source --------------------------------- #
                 if mtype == "set_source":
                     raw_list = msg.get("images") or (
                         [msg["image"]] if "image" in msg else [])
-                    emb, n_ok = await loop.run_in_executor(
-                        _executor, _compute_averaged_embedding, raw_list)
-                    if emb is None:
+                    print(f"[set_source] received {len(raw_list)} image(s) …")
+                    t0 = time.perf_counter()
+                    face = await loop.run_in_executor(
+                        _executor, _detect_source_face, raw_list)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    if face is None:
+                        print(f"[set_source] FAILED — no face detected ({elapsed:.0f} ms)")
                         await _send(websocket, {
                             "type": "source_set", "success": False,
                             "message": "No face detected in any source image.",
                         })
                     else:
-                        source_embedding = emb
+                        source_face = face
+                        print(f"[set_source] OK ({elapsed:.0f} ms)")
                         await _send(websocket, {
                             "type": "source_set", "success": True,
-                            "faces_used": n_ok, "images_sent": len(raw_list),
+                            "faces_used": 1, "images_sent": len(raw_list),
                         })
 
-                # -- frame -------------------------------------- #
                 elif mtype == "frame":
-                    if source_embedding is None:
-                        # Must still respond so the client releases _in_flight
+                    if source_face is None:
                         await _send(websocket, {
                             "type": "error",
                             "message": "No source face set. Send set_source first.",
@@ -183,10 +208,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     item = (
                         msg.get("frame_id", 0),
                         msg.get("frame"),
-                        source_embedding,
-                        {**DEFAULT_PARAMS, **msg.get("params", {})},
+                        source_face,
+                        msg.get("params") or {},
                     )
-                    # Replace stale queued frame with the latest one
                     if frame_queue.full():
                         try:
                             frame_queue.get_nowait()
@@ -204,54 +228,50 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
         except WebSocketDisconnect:
-            pass
+            print(f"[WS] client disconnected: {client.host}:{client.port}")
         except Exception as exc:
-            print(f"[RECV] {exc}")
+            print(f"[RECV] unexpected error: {exc}")
         finally:
-            # Signal the processor to shut down
             try:
                 frame_queue.put_nowait(None)
             except asyncio.QueueFull:
                 frame_queue.get_nowait()
                 frame_queue.put_nowait(None)
 
-    # ---------------------------------------------------------- #
-    # Processor: GPU inference, one frame at a time               #
-    # ---------------------------------------------------------- #
     async def _proc_loop():
         while True:
             item = await frame_queue.get()
             if item is None:
                 break
-            frame_id, frame_bytes, s_e, params = item
+            frame_id, frame_bytes, s_face, params = item
+            t0 = time.perf_counter()
             try:
                 result_bytes = await loop.run_in_executor(
-                    _executor, _process_frame_sync, frame_bytes, s_e, params)
+                    _executor, _process_frame_sync, frame_bytes, s_face, params)
+                elapsed = (time.perf_counter() - t0) * 1000
                 if result_bytes is not None:
+                    if _verbose:
+                        print(f"[proc] frame {frame_id} done in {elapsed:.1f} ms "
+                              f"({len(result_bytes)//1024}KB)")
                     await _send(websocket, {
                         "type": "frame_result",
                         "frame_id": frame_id,
                         "frame": result_bytes,
                     })
                 else:
-                    # Decode failed — client must still release _in_flight
                     await _send(websocket, {
-                        "type": "error",
-                        "message": "Failed to decode frame.",
+                        "type": "error", "message": "Failed to decode frame.",
                     })
             except Exception as exc:
-                print(f"[PROC] {exc}")
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"[proc] frame {frame_id} ERROR after {elapsed:.1f} ms: {exc}")
                 try:
-                    await _send(websocket, {
-                        "type": "error",
-                        "message": str(exc),
-                    })
+                    await _send(websocket, {"type": "error", "message": str(exc)})
                 except Exception:
                     pass
 
     recv_task = asyncio.create_task(_recv_loop())
     proc_task = asyncio.create_task(_proc_loop())
-
     done, pending = await asyncio.wait(
         [recv_task, proc_task], return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
@@ -260,22 +280,51 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ------------------------------------------------------------------ #
-# Synchronous GPU processing (runs inside the thread-pool executor)   #
+# Synchronous GPU processing                                           #
 # ------------------------------------------------------------------ #
 
-def _process_frame_sync(frame_bytes: bytes, source_embedding: np.ndarray,
-                        params: dict) -> bytes | None:
-    """Decode JPEG, detect + swap faces on GPU, re-encode to JPEG."""
+def _process_frame_sync(frame_bytes: bytes, source_face, params: dict) -> bytes | None:
+    """Decode JPEG → detect → swap → optional enhance → re-encode JPEG."""
     nparr = np.frombuffer(frame_bytes, np.uint8)
     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame_bgr is None:
         return None
 
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    result_rgb = _swap_core.process_frame(frame_rgb, source_embedding, params)
-    result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+    # Apply per-frame params to globals (safe: single-threaded executor)
+    modules.globals.opacity = float(params.get("opacity", 1.0))
+    modules.globals.mouth_mask = bool(params.get("mouth_mask", False))
+    modules.globals.sharpness = float(params.get("sharpness", 0.0))
+    enhance = params.get("enhance")  # None | "gpen256" | "gpen512"
 
-    ok, buf = cv2.imencode('.jpg', result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    t_det = time.perf_counter()
+    target_faces = get_many_faces(frame_bgr)
+    if _verbose:
+        n = len(target_faces) if target_faces else 0
+        h, w = frame_bgr.shape[:2]
+        print(f"[proc] {w}x{h}  det={n} faces  {(time.perf_counter()-t_det)*1000:.1f}ms")
+
+    if not target_faces:
+        ok, buf = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return buf.tobytes() if ok else None
+
+    t_swap = time.perf_counter()
+    result = frame_bgr
+    for target_face in target_faces:
+        result = swap_face(source_face, target_face, result)
+    if _verbose:
+        print(f"[proc] swap {(time.perf_counter()-t_swap)*1000:.1f}ms")
+
+    if enhance:
+        t_enh = time.perf_counter()
+        for face in target_faces:
+            if enhance == "gpen256":
+                result = face_enhancer_gpen256.enhance_face(result, face)
+            elif enhance == "gpen512":
+                result = face_enhancer_gpen512.enhance_face(result, face)
+        if _verbose:
+            print(f"[proc] enhance({enhance}) {(time.perf_counter()-t_enh)*1000:.1f}ms")
+
+    ok, buf = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
 
@@ -310,23 +359,20 @@ def _load_source_images(path: str) -> list[bytes]:
     return []
 
 
-def _compute_averaged_embedding(raw_images: list) -> tuple[np.ndarray | None, int]:
-    embeddings = []
+def _detect_source_face(raw_images: list):
+    """Return the highest-confidence insightface Face from any source image."""
+    best_face = None
+    best_score = -1.0
     for img_bytes in raw_images:
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             continue
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        emb = _swap_core.get_embedding(img_rgb)
-        if emb is not None:
-            embeddings.append(emb)
-
-    if not embeddings:
-        return None, 0
-
-    avg = np.mean(np.stack(embeddings, axis=0), axis=0).astype(np.float32)
-    return avg, len(embeddings)
+        face = get_one_face(img)
+        if face is not None and face.det_score > best_score:
+            best_score = face.det_score
+            best_face = face
+    return best_face
 
 
 async def _send(ws: WebSocket, payload: dict):
@@ -340,9 +386,9 @@ _args: argparse.Namespace | None = None
 
 
 def main():
-    global _args
+    global _args, _verbose
     parser = argparse.ArgumentParser(
-        description="Rope face-swap WebSocket server",
+        description="Rope face-swap WebSocket server (Deep-Live-Cam backend)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"),
@@ -351,9 +397,12 @@ def main():
                         help="Port to listen on (env: PORT)")
     parser.add_argument("--source", default=os.getenv("SOURCE_PATH", ""),
                         help="Source face image or folder (env: SOURCE_PATH)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-frame timing logs")
     _args = parser.parse_args()
+    _verbose = _args.verbose
 
-    uvicorn.run(app, host=_args.host, port=_args.port, log_level="info")
+    uvicorn.run(app, host=_args.host, port=_args.port, log_level="warning")
 
 
 if __name__ == "__main__":
