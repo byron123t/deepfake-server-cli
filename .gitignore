@@ -1,0 +1,9 @@
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.mov
+__pycache__/
+.env
+*.onnx
+*.pth
