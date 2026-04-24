@@ -1,49 +1,34 @@
 """
 Rope Face-Swap API Server
 =========================
-Receives face crops + 5-pt keypoints from a client over WebSocket,
-runs the inswapper GAN + optional super-resolution restorer on GPU,
-and streams swapped face crops back.
+Receives full JPEG frames from a client over WebSocket, runs face detection +
+inswapper GAN + optional restorer on GPU, and streams swapped frames back.
 
 Usage:
     python server.py --source /path/to/source_face.jpg [--host 0.0.0.0] [--port 8765]
-    python server.py --source /path/to/source_folder/
-
-    Or set values in .env and run: python server.py
 
 WebSocket endpoint: ws://<host>:<port>/ws
 
 Protocol (msgpack-serialised dicts):
 
   Client -> Server:
-    { "type": "set_source", "images": [<bytes>, ...] }  # 1-N JPEGs; embeddings averaged
-    { "type": "swap",
+    { "type": "set_source", "images": [<bytes>, ...] }
+    { "type": "swap_frame",
       "frame_id": int,
-      "params": { ... }                                  # optional, overrides defaults
-      "faces": [
-        { "crop":  <bytes>,                              # JPEG of padded face region
-          "kps":   [[x,y]*5],                            # 5-pt landmarks in crop coords
-          "bbox":  [cx1, cy1, cx2, cy2]                  # crop origin in full frame
-        }, ...
-      ]
+      "frame":   <bytes>,           # JPEG of full video frame
+      "params":  { ... }            # optional
     }
 
   Server -> Client:
-    { "type": "source_set", "success": bool, "faces_used": int, "images_sent": int }
-    { "type": "source_ready" }                           # if --source was given at startup
-    { "type": "swapped",
-      "frame_id": int,
-      "faces": [
-        { "swapped": <bytes>,                            # JPEG of swapped crop (same size)
-          "bbox":    [cx1, cy1, cx2, cy2]
-        }, ...
-      ]
-    }
-    { "type": "error", "message": str }
+    { "type": "source_set",    "success": bool, "faces_used": int, "images_sent": int }
+    { "type": "source_ready" }
+    { "type": "frame_result",  "frame_id": int, "frame": <bytes> }  # JPEG of processed frame
+    { "type": "error",         "message": str }
 """
 
 import argparse
 import asyncio
+import concurrent.futures
 import glob
 import os
 import sys
@@ -63,12 +48,14 @@ import rope.Models as ModelsModule
 from rope.SwapCore import SwapCore, DEFAULT_PARAMS
 
 # ------------------------------------------------------------------ #
-# Globals populated at startup                                         #
+# Globals                                                              #
 # ------------------------------------------------------------------ #
 _models: ModelsModule.Models | None = None
 _swap_core: SwapCore | None = None
 _startup_embedding: np.ndarray | None = None
-_gpu_lock = asyncio.Lock()
+
+# Single-threaded executor: all GPU inference serialised here
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # ------------------------------------------------------------------ #
 # App                                                                  #
@@ -89,12 +76,14 @@ async def _startup():
         if not raw_images:
             print(f"[WARN] No readable images found at: {_args.source}")
         else:
-            emb, n_ok = _compute_averaged_embedding(raw_images)
+            loop = asyncio.get_running_loop()
+            emb, n_ok = await loop.run_in_executor(
+                _executor, _compute_averaged_embedding, raw_images)
             if emb is None:
                 print(f"[WARN] No face detected in {len(raw_images)} source image(s).")
             else:
                 _startup_embedding = emb
-                print(f"Source face loaded: {n_ok}/{len(raw_images)} image(s) used from {_args.source}")
+                print(f"Source face loaded: {n_ok}/{len(raw_images)} image(s) from {_args.source}")
 
 
 @app.get("/health")
@@ -143,77 +132,130 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     source_embedding: np.ndarray | None = _startup_embedding
-
     if source_embedding is not None:
         await _send(websocket, {"type": "source_ready"})
 
-    try:
-        while True:
-            raw = await websocket.receive_bytes()
-            msg = msgpack.unpackb(raw, raw=False)
-            mtype = msg.get("type")
+    # Depth-1 queue: always process the most recent frame, drop stale ones
+    frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    loop = asyncio.get_running_loop()
 
-            # -------------------------------------------------- #
-            if mtype == "set_source":
-                raw_list = msg.get("images") or ([msg["image"]] if "image" in msg else [])
-                async with _gpu_lock:
-                    emb, n_ok = _compute_averaged_embedding(raw_list)
-                if emb is None:
-                    await _send(websocket, {
-                        "type": "source_set", "success": False,
-                        "message": "No face detected in any source image."
-                    })
-                else:
-                    source_embedding = emb
-                    await _send(websocket, {
-                        "type": "source_set", "success": True,
-                        "faces_used": n_ok, "images_sent": len(raw_list),
-                    })
+    # ---------------------------------------------------------- #
+    # Receiver: reads WebSocket messages as fast as they arrive   #
+    # ---------------------------------------------------------- #
+    async def _recv_loop():
+        nonlocal source_embedding
+        try:
+            while True:
+                raw = await websocket.receive_bytes()
+                msg = msgpack.unpackb(raw, raw=False)
+                mtype = msg.get("type")
 
-            # -------------------------------------------------- #
-            elif mtype == "swap":
-                if source_embedding is None:
-                    await _send(websocket, {
-                        "type": "error",
-                        "message": "No source face set. Send set_source first."
-                    })
-                    continue
-
-                frame_id = msg.get("frame_id", 0)
-                params = {**DEFAULT_PARAMS, **msg.get("params", {})}
-                result_faces = []
-
-                async with _gpu_lock:
-                    for face in msg.get("faces", []):
-                        swapped_bytes = _process_face(
-                            face["crop"], face["kps"], face["bbox"],
-                            source_embedding, params)
-                        result_faces.append({
-                            "swapped": swapped_bytes,
-                            "bbox": face["bbox"],
+                # -- set_source --------------------------------- #
+                if mtype == "set_source":
+                    raw_list = msg.get("images") or (
+                        [msg["image"]] if "image" in msg else [])
+                    emb, n_ok = await loop.run_in_executor(
+                        _executor, _compute_averaged_embedding, raw_list)
+                    if emb is None:
+                        await _send(websocket, {
+                            "type": "source_set", "success": False,
+                            "message": "No face detected in any source image.",
+                        })
+                    else:
+                        source_embedding = emb
+                        await _send(websocket, {
+                            "type": "source_set", "success": True,
+                            "faces_used": n_ok, "images_sent": len(raw_list),
                         })
 
-                await _send(websocket, {
-                    "type": "swapped",
-                    "frame_id": frame_id,
-                    "faces": result_faces,
-                })
+                # -- swap_frame --------------------------------- #
+                elif mtype == "swap_frame":
+                    if source_embedding is None:
+                        continue  # silently drop until source is set
+                    item = (
+                        msg.get("frame_id", 0),
+                        msg.get("frame"),
+                        source_embedding,
+                        {**DEFAULT_PARAMS, **msg.get("params", {})},
+                    )
+                    # Replace stale queued frame with the latest one
+                    if frame_queue.full():
+                        try:
+                            frame_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    try:
+                        frame_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        pass
 
-            # -------------------------------------------------- #
-            else:
-                await _send(websocket, {
-                    "type": "error",
-                    "message": f"Unknown message type: {mtype}"
-                })
+                else:
+                    await _send(websocket, {
+                        "type": "error",
+                        "message": f"Unknown message type: {mtype}",
+                    })
 
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        print(f"[ERROR] {exc}")
-        try:
-            await _send(websocket, {"type": "error", "message": str(exc)})
-        except Exception:
+        except WebSocketDisconnect:
             pass
+        except Exception as exc:
+            print(f"[RECV] {exc}")
+        finally:
+            # Signal the processor to shut down
+            try:
+                frame_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                frame_queue.get_nowait()
+                frame_queue.put_nowait(None)
+
+    # ---------------------------------------------------------- #
+    # Processor: runs GPU inference for one frame at a time       #
+    # ---------------------------------------------------------- #
+    async def _proc_loop():
+        while True:
+            item = await frame_queue.get()
+            if item is None:
+                break
+            frame_id, frame_bytes, s_e, params = item
+            try:
+                result_bytes = await loop.run_in_executor(
+                    _executor, _process_frame_sync, frame_bytes, s_e, params)
+                if result_bytes is not None:
+                    await _send(websocket, {
+                        "type": "frame_result",
+                        "frame_id": frame_id,
+                        "frame": result_bytes,
+                    })
+            except Exception as exc:
+                print(f"[PROC] {exc}")
+
+    recv_task = asyncio.create_task(_recv_loop())
+    proc_task = asyncio.create_task(_proc_loop())
+
+    done, pending = await asyncio.wait(
+        [recv_task, proc_task], return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+# ------------------------------------------------------------------ #
+# Synchronous GPU processing (runs in the thread-pool executor)       #
+# ------------------------------------------------------------------ #
+
+def _process_frame_sync(frame_bytes: bytes, source_embedding: np.ndarray,
+                        params: dict) -> bytes | None:
+    """Decode JPEG, swap faces on GPU, re-encode to JPEG."""
+    nparr = np.frombuffer(frame_bytes, np.uint8)
+    frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame_bgr is None:
+        return None
+
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    result_rgb = _swap_core.process_frame(frame_rgb, source_embedding, params)
+    result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+
+    ok, buf = cv2.imencode('.jpg', result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else None
 
 
 # ------------------------------------------------------------------ #
@@ -224,7 +266,6 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def _load_source_images(path: str) -> list[bytes]:
-    """Return JPEG-encoded bytes for each image found at path (file or directory)."""
     if os.path.isfile(path):
         img = cv2.imread(path)
         if img is None:
@@ -249,7 +290,6 @@ def _load_source_images(path: str) -> list[bytes]:
 
 
 def _compute_averaged_embedding(raw_images: list) -> tuple[np.ndarray | None, int]:
-    """Decode each JPEG, detect face, compute embedding. Average all valid embeddings."""
     embeddings = []
     for img_bytes in raw_images:
         nparr = np.frombuffer(img_bytes, np.uint8)
@@ -266,20 +306,6 @@ def _compute_averaged_embedding(raw_images: list) -> tuple[np.ndarray | None, in
 
     avg = np.mean(np.stack(embeddings, axis=0), axis=0).astype(np.float32)
     return avg, len(embeddings)
-
-
-def _process_face(crop_bytes: bytes, kps_list: list, bbox: list,
-                  source_embedding: np.ndarray, params: dict) -> bytes:
-    nparr = np.frombuffer(crop_bytes, np.uint8)
-    crop = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    kps = np.array(kps_list, dtype=np.float32)
-
-    swapped_rgb = _swap_core.process(crop_rgb, kps, source_embedding, params)
-
-    swapped_bgr = cv2.cvtColor(swapped_rgb, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".jpg", swapped_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
-    return buf.tobytes()
 
 
 async def _send(ws: WebSocket, payload: dict):

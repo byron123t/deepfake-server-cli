@@ -53,6 +53,20 @@ class SwapCore:
             [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
              [201.26117, 371.41043], [313.08905, 371.15118]])
 
+    def process_frame(self, frame_rgb: np.ndarray, source_embedding: np.ndarray,
+                      parameters: dict = None) -> np.ndarray:
+        """Detect faces in frame_rgb and swap each one in-place on GPU.
+        Returns HxWx3 uint8 RGB numpy array."""
+        if parameters is None:
+            parameters = DEFAULT_PARAMS.copy()
+        img = torch.from_numpy(frame_rgb.astype('uint8')).to(device).permute(2, 0, 1)
+        kpss = self.models.run_detect(img, 'Retinaface', max_num=4, score=0.5)
+        if len(kpss) == 0:
+            return frame_rgb
+        for kps in kpss:
+            img = self._swap_core(img, kps, source_embedding, parameters)
+        return img.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+
     def get_embedding(self, image_rgb: np.ndarray) -> np.ndarray | None:
         """Detect face in image and return ArcFace embedding."""
         img = torch.from_numpy(image_rgb.astype('uint8')).to(device).permute(2, 0, 1)
@@ -161,7 +175,7 @@ class SwapCore:
         output_size = int(128 * dim)
         output = torch.zeros((output_size, output_size, 3), dtype=torch.float32, device=device)
         input_face_affined = input_face_affined.permute(1, 2, 0)
-        input_face_affined = torch.div(input_face_affined, 255.0)
+        input_face_affined = torch.div(input_face_affined.float(), 255.0)
 
         for k in range(itex):
             for j in range(dim):
@@ -296,7 +310,7 @@ class SwapCore:
         return diff.permute(2, 0, 1)
 
     def _apply_occlusion(self, img, amount):
-        img = torch.div(img, 255)
+        img = torch.div(img.float(), 255)
         img = torch.unsqueeze(img, 0)
         outpred = torch.ones((256, 256), dtype=torch.float32, device=device).contiguous()
         self.models.run_occluder(img, outpred)
@@ -320,7 +334,7 @@ class SwapCore:
         return outpred.reshape(1, 256, 256)
 
     def _apply_face_parser(self, img, face_amount, mouth_amount):
-        img_n = torch.div(img, 255)
+        img_n = torch.div(img.float(), 255)
         img_n = v2.functional.normalize(img_n, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         img_n = img_n.reshape(1, 3, 512, 512)
         outpred = torch.empty((1, 19, 512, 512), dtype=torch.float32, device=device).contiguous()
@@ -390,7 +404,7 @@ class SwapCore:
             except Exception:
                 return swapped_face
 
-        temp = torch.div(temp, 255)
+        temp = torch.div(temp.float(), 255)
         temp = v2.functional.normalize(temp, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         if parameters['RestorerTypeTextSel'] == 'GPEN256':
             temp = t256(temp)
