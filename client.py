@@ -1,9 +1,11 @@
 """
 Rope Face-Swap Client
 =====================
-Captures webcam frames, detects faces locally using MediaPipe,
-sends face crops + 5-pt keypoints to the server, and displays the
-swapped result composited back onto the live video.
+Captures webcam frames, sends them as JPEG to the server, and displays
+the fully-composited swapped frame that comes back.
+
+All face detection and compositing runs on the server GPU — the client
+does nothing heavier than JPEG encode/decode.
 
 Usage:
     python client.py --server ws://SERVER_IP:8765/ws --source /path/to/source.jpg
@@ -13,7 +15,7 @@ Usage:
 
 Keys:
     q    - quit
-    s    - resend source to server (re-reads --source file or folder)
+    s    - resend source to server
     r    - toggle face restoration on server (GFPGAN)
     +/-  - increase/decrease blend smoothing
 """
@@ -33,81 +35,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import cv2
-import mediapipe as mp
 import msgpack
 import numpy as np
 import websockets
 
-# ------------------------------------------------------------------ #
-# MediaPipe setup                                                      #
-# ------------------------------------------------------------------ #
-_mp_fm = mp.solutions.face_mesh
-
-_face_mesh = _mp_fm.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=4,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5)
-
-# MediaPipe FaceMesh landmark indices -> ArcFace 5-point format
-# [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]
-_ARCFACE_LM = [33, 263, 1, 61, 291]
-
-_CROP_PAD = 0.4   # padding ratio around detected face bbox
-
 _SOURCE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-
-def detect_faces(frame_rgb: np.ndarray) -> list[dict]:
-    """
-    Returns a list of dicts:
-      { 'crop_rgb': HxWx3, 'kps': 5x2 float32, 'bbox': [cx1,cy1,cx2,cy2] }
-    kps are in crop-relative coordinates.
-    """
-    h, w = frame_rgb.shape[:2]
-    results = _face_mesh.process(frame_rgb)
-    if not results.multi_face_landmarks:
-        return []
-
-    faces = []
-    for face_lm in results.multi_face_landmarks:
-        lms = face_lm.landmark
-
-        pts = np.array([[lms[i].x * w, lms[i].y * h] for i in _ARCFACE_LM], dtype=np.float32)
-
-        all_x = np.array([lm.x * w for lm in lms])
-        all_y = np.array([lm.y * h for lm in lms])
-        fx1, fy1 = np.min(all_x), np.min(all_y)
-        fx2, fy2 = np.max(all_x), np.max(all_y)
-
-        face_w = fx2 - fx1
-        face_h = fy2 - fy1
-        pad_x = face_w * _CROP_PAD
-        pad_y = face_h * _CROP_PAD
-
-        cx1 = max(int(fx1 - pad_x), 0)
-        cy1 = max(int(fy1 - pad_y), 0)
-        cx2 = min(int(fx2 + pad_x), w)
-        cy2 = min(int(fy2 + pad_y), h)
-
-        crop_rgb = frame_rgb[cy1:cy2, cx1:cx2].copy()
-        if crop_rgb.size == 0:
-            continue
-
-        kps_local = pts - np.array([[cx1, cy1]], dtype=np.float32)
-
-        faces.append({
-            "crop_rgb": crop_rgb,
-            "kps": kps_local,
-            "bbox": [cx1, cy1, cx2, cy2],
-        })
-
-    return faces
-
+# ------------------------------------------------------------------ #
+# Source helpers                                                       #
+# ------------------------------------------------------------------ #
 
 def _collect_source_images(path: str) -> list[bytes]:
-    """Return JPEG-encoded bytes for each source image found at path (file or dir)."""
     if os.path.isfile(path):
         img = cv2.imread(path)
         if img is None:
@@ -134,11 +72,28 @@ def _collect_source_images(path: str) -> list[bytes]:
 
 
 # ------------------------------------------------------------------ #
-# Shared state between capture thread and async WS loop               #
+# Shared display state                                                 #
 # ------------------------------------------------------------------ #
 _frame_q: queue.Queue = queue.Queue(maxsize=2)
-_result_q: queue.Queue = queue.Queue(maxsize=8)
 
+_display_lock = threading.Lock()
+_display_frame: np.ndarray | None = None  # RGB
+
+
+def _set_display(frame: np.ndarray) -> None:
+    global _display_frame
+    with _display_lock:
+        _display_frame = frame
+
+
+def _get_display() -> np.ndarray | None:
+    with _display_lock:
+        return _display_frame
+
+
+# ------------------------------------------------------------------ #
+# Capture thread — raw BGR frames only, no processing                 #
+# ------------------------------------------------------------------ #
 
 def _capture_thread(camera_id: int, width: int, height: int):
     cap = cv2.VideoCapture(camera_id)
@@ -153,15 +108,12 @@ def _capture_thread(camera_id: int, width: int, height: int):
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        faces = detect_faces(frame_rgb)
-
         if _frame_q.full():
             try:
                 _frame_q.get_nowait()
             except queue.Empty:
                 pass
-        _frame_q.put((frame_rgb, faces))
+        _frame_q.put(frame_bgr)
 
     cap.release()
 
@@ -170,10 +122,19 @@ def _capture_thread(camera_id: int, width: int, height: int):
 # Async WebSocket client                                               #
 # ------------------------------------------------------------------ #
 
+# Limits to one frame in-flight at a time so we always send the freshest
+# frame and never build up a stale backlog.
+_in_flight: asyncio.Semaphore | None = None
+
+
 async def _ws_client(uri: str, source_path: str, params_ref: dict):
+    global _in_flight
+    _in_flight = asyncio.Semaphore(1)
+
     print(f"Connecting to {uri} …")
     async with websockets.connect(uri, max_size=20 * 1024 * 1024) as ws:
         print("Connected.")
+        _ws_ref.append(ws)
 
         if source_path:
             await _send_source(ws, source_path)
@@ -199,43 +160,33 @@ async def _sender(ws, params_ref: dict):
     loop = asyncio.get_event_loop()
     frame_id = 0
     while True:
+        # Wait for the server to finish the previous frame before grabbing
+        # the next one — this keeps the queue flushed to the freshest frame.
+        await _in_flight.acquire()
+
         try:
-            frame_rgb, faces = await loop.run_in_executor(
+            frame_bgr = await loop.run_in_executor(
                 None, lambda: _frame_q.get(timeout=1.0))
         except queue.Empty:
+            _in_flight.release()
             continue
 
-        if not faces:
-            _result_q.put({"frame_rgb": frame_rgb, "faces": []})
-            continue
+        # Show raw frame immediately so the preview never freezes.
+        _set_display(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
-        msg_faces = []
-        for f in faces:
-            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(f["crop_rgb"], cv2.COLOR_RGB2BGR),
-                                   [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                continue
-            msg_faces.append({
-                "crop": buf.tobytes(),
-                "kps": f["kps"].tolist(),
-                "bbox": f["bbox"],
-            })
-
-        if not msg_faces:
-            _result_q.put({"frame_rgb": frame_rgb, "faces": []})
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            _in_flight.release()
             continue
 
         payload = msgpack.packb({
-            "type": "swap",
+            "type": "frame",
             "frame_id": frame_id,
             "params": params_ref.copy(),
-            "faces": msg_faces,
+            "frame": buf.tobytes(),
         }, use_bin_type=True)
         await ws.send(payload)
-
-        _result_q.put({"frame_rgb": frame_rgb.copy(), "frame_id": frame_id, "pending": True})
         frame_id += 1
-        await asyncio.sleep(0)
 
 
 async def _receiver(ws):
@@ -243,71 +194,38 @@ async def _receiver(ws):
         msg = msgpack.unpackb(raw, raw=False)
         mtype = msg.get("type")
 
-        if mtype == "source_set":
+        if mtype == "frame_result":
+            frame_bytes = msg.get("frame")
+            if frame_bytes:
+                nparr = np.frombuffer(frame_bytes, np.uint8)
+                result_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if result_bgr is not None:
+                    _set_display(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
+            if _in_flight:
+                _in_flight.release()
+
+        elif mtype == "source_set":
             if msg.get("success"):
                 n_ok = msg.get("faces_used", "?")
                 n_sent = msg.get("images_sent", "?")
                 print(f"[source_set] OK — {n_ok}/{n_sent} image(s) had a detectable face")
             else:
-                detail = msg.get("message", "no face found")
-                print(f"[source_set] FAILED: {detail}")
+                print(f"[source_set] FAILED: {msg.get('message', 'no face found')}")
 
         elif mtype == "source_ready":
             print("[server] Source face ready (loaded at server startup).")
 
-        elif mtype == "swapped":
-            fid = msg.get("frame_id")
-            pending = None
-            tmp = []
-            try:
-                while True:
-                    item = _result_q.get_nowait()
-                    if item.get("frame_id") == fid and item.get("pending"):
-                        pending = item
-                    else:
-                        tmp.append(item)
-            except queue.Empty:
-                pass
-            for t in tmp:
-                try:
-                    _result_q.put_nowait(t)
-                except queue.Full:
-                    pass
-
-            if pending is None:
-                continue
-
-            frame_rgb = pending["frame_rgb"]
-            for face_result in msg.get("faces", []):
-                swapped_bytes = face_result["swapped"]
-                bbox = face_result["bbox"]
-                cx1, cy1, cx2, cy2 = bbox
-
-                nparr = np.frombuffer(swapped_bytes, np.uint8)
-                swapped_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                swapped_rgb = cv2.cvtColor(swapped_bgr, cv2.COLOR_BGR2RGB)
-
-                crop_h, crop_w = cy2 - cy1, cx2 - cx1
-                if swapped_rgb.shape[:2] != (crop_h, crop_w):
-                    swapped_rgb = cv2.resize(swapped_rgb, (crop_w, crop_h))
-
-                frame_rgb[cy1:cy2, cx1:cx2] = swapped_rgb
-
-            try:
-                _result_q.put_nowait({"frame_rgb": frame_rgb, "faces": [], "ready": True})
-            except queue.Full:
-                pass
-
         elif mtype == "error":
             print(f"[server error] {msg.get('message')}")
+            if _in_flight:
+                _in_flight.release()
 
 
 # ------------------------------------------------------------------ #
-# Display loop (runs in main thread)                                   #
+# Display loop (main thread)                                           #
 # ------------------------------------------------------------------ #
 
 def _display_loop(params_ref: dict, source_path_ref: list):
-    latest_frame = None
     fps_t = time.time()
     fps_count = 0
     fps_display = 0.0
@@ -315,16 +233,10 @@ def _display_loop(params_ref: dict, source_path_ref: list):
     print("Display started. Press 'q' to quit, 's' to resend source, 'r' to toggle restorer.")
 
     while True:
-        try:
-            while True:
-                item = _result_q.get_nowait()
-                if item.get("ready") or not item.get("pending"):
-                    latest_frame = item["frame_rgb"]
-        except queue.Empty:
-            pass
+        frame = _get_display()
 
-        if latest_frame is not None:
-            display = cv2.cvtColor(latest_frame, cv2.COLOR_RGB2BGR)
+        if frame is not None:
+            display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             fps_count += 1
             now = time.time()
@@ -344,7 +256,7 @@ def _display_loop(params_ref: dict, source_path_ref: list):
         if key == ord('q'):
             break
         elif key == ord('s'):
-            if source_path_ref[0] and _ws_loop:
+            if source_path_ref[0] and _ws_loop and _ws_ref:
                 asyncio.run_coroutine_threadsafe(
                     _send_source(_ws_ref[0], source_path_ref[0]),
                     _ws_loop)
@@ -364,7 +276,6 @@ def _display_loop(params_ref: dict, source_path_ref: list):
 # ------------------------------------------------------------------ #
 
 def _pick_source_face() -> str:
-    """Block until the user selects a source image; exit if cancelled."""
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)

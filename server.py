@@ -54,6 +54,7 @@ load_dotenv()
 import cv2
 import msgpack
 import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -171,7 +172,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
             # -------------------------------------------------- #
-            elif mtype == "swap":
+            elif mtype == "frame":
                 if source_embedding is None:
                     await _send(websocket, {
                         "type": "error",
@@ -181,22 +182,29 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 frame_id = msg.get("frame_id", 0)
                 params = {**DEFAULT_PARAMS, **msg.get("params", {})}
-                result_faces = []
+
+                nparr = np.frombuffer(msg["frame"], np.uint8)
+                frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if frame_bgr is None:
+                    continue
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
                 async with _gpu_lock:
-                    for face in msg.get("faces", []):
-                        swapped_bytes = _process_face(
-                            face["crop"], face["kps"], face["bbox"],
-                            source_embedding, params)
-                        result_faces.append({
-                            "swapped": swapped_bytes,
-                            "bbox": face["bbox"],
-                        })
+                    img_t = torch.from_numpy(frame_rgb.astype("uint8")).to("cuda").permute(2, 0, 1)
+                    kpss = _models.run_detect(img_t, "Retinaface", max_num=4, score=0.5)
+                    result_rgb = frame_rgb
+                    for kps in kpss:
+                        result_rgb = _swap_core.process(result_rgb, kps, source_embedding, params)
+
+                result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+                ok, buf = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ok:
+                    continue
 
                 await _send(websocket, {
-                    "type": "swapped",
+                    "type": "frame_result",
                     "frame_id": frame_id,
-                    "faces": result_faces,
+                    "frame": buf.tobytes(),
                 })
 
             # -------------------------------------------------- #
